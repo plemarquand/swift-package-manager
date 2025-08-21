@@ -21,6 +21,22 @@ import _InternalTestSupport
 import TSCTestSupport
 import Testing
 
+fileprivate func execute(
+    _ args: [String],
+    packagePath: AbsolutePath? = nil,
+    configuration: BuildConfiguration = .debug,
+    buildSystem: BuildSystemProvider.Kind,
+    throwIfCommandFails: Bool = true
+) async throws -> (stdout: String, stderr: String) {
+    try await executeSwiftTest(
+        packagePath,
+        configuration: configuration,
+        extraArgs: args,
+        throwIfCommandFails: throwIfCommandFails,
+        buildSystem: buildSystem,
+    )
+}
+
 @Suite(
     .serialized,  // to limit the number of swift executable running.
     .tags(
@@ -29,22 +45,6 @@ import Testing
     )
 )
 struct TestCommandTests {
-
-    private func execute(
-        _ args: [String],
-        packagePath: AbsolutePath? = nil,
-        configuration: BuildConfiguration = .debug,
-        buildSystem: BuildSystemProvider.Kind,
-        throwIfCommandFails: Bool = true
-    ) async throws -> (stdout: String, stderr: String) {
-        try await executeSwiftTest(
-            packagePath,
-            configuration: configuration,
-            extraArgs: args,
-            throwIfCommandFails: throwIfCommandFails,
-            buildSystem: buildSystem,
-        )
-    }
 
     @Test(
         arguments: SupportedBuildSystemOnAllPlatforms, BuildConfiguration.allCases,
@@ -1137,7 +1137,7 @@ struct TestCommandTests {
             try await fixture(name: "Miscellaneous/Errors/FatalErrorInSingleXCTest/TypeLibrary") { fixturePath in
                 // WHEN swift-test is executed
                 let error = await #expect(throws: SwiftPMError.self) {
-                    try await self.execute(
+                    try await execute(
                         [],
                         packagePath: fixturePath,
                         configuration: configuration,
@@ -1172,4 +1172,173 @@ struct TestCommandTests {
         }
     }
 
+    // MARK: - LLDB Flag Validation Tests
+
+    @Suite
+    struct LLDBTests {
+        @Test(
+            arguments: SupportedBuildSystemOnAllPlatforms, BuildConfiguration.allCases,
+        )
+        func lldbWithParallelThrowsError(
+            buildSystem: BuildSystemProvider.Kind,
+            configuration: BuildConfiguration,
+        ) async throws {
+            try await fixture(name: "Miscellaneous/EchoExecutable") { fixturePath in
+                let error = await #expect(throws: SwiftPMError.self) {
+                    try await execute(
+                        ["--lldb", "--parallel"],
+                        packagePath: fixturePath,
+                        configuration: configuration,
+                        buildSystem: buildSystem
+                    )
+                }
+
+                guard case let SwiftPMError.executionFailure(_, stdout, stderr) = try #require(error) else {
+                    Issue.record("Incorrect error was raised.")
+                    return
+                }
+
+                #expect(
+                    stderr.contains("error: --lldb cannot be used with --parallel (debugging requires sequential execution)"),
+                    "got stdout: \(stdout), stderr: \(stderr)",
+                )
+            }
+        }
+
+        @Test(
+            arguments: SupportedBuildSystemOnAllPlatforms, BuildConfiguration.allCases,
+        )
+        func lldbWithNumWorkersThrowsError(
+            buildSystem: BuildSystemProvider.Kind,
+            configuration: BuildConfiguration,
+        ) async throws {
+            try await fixture(name: "Miscellaneous/EchoExecutable") { fixturePath in
+                let error = await #expect(throws: SwiftPMError.self) {
+                    try await execute(
+                        ["--lldb", "--parallel", "--num-workers", "2"],
+                        packagePath: fixturePath,
+                        configuration: configuration,
+                        buildSystem: buildSystem,
+                    )
+                }
+                guard case let SwiftPMError.executionFailure(_, stdout, stderr) = try #require(error) else {
+                    Issue.record("Incorrect error was raised.")
+                    return
+                }
+
+                // Should hit the --parallel error first since validation is done in order
+                #expect(
+                    stderr.contains("error: --lldb cannot be used with --parallel (debugging requires sequential execution)"),
+                    "got stdout: \(stdout), stderr: \(stderr)",
+                )
+            }
+        }
+
+        @Test(
+            arguments: SupportedBuildSystemOnAllPlatforms, BuildConfiguration.allCases,
+        )
+        func lldbWithNumWorkersOnlyThrowsError(
+            buildSystem: BuildSystemProvider.Kind,
+            configuration: BuildConfiguration,
+        ) async throws {
+            try await fixture(name: "Miscellaneous/EchoExecutable") { fixturePath in
+                let error = await #expect(throws: SwiftPMError.self) {
+                    try await execute(
+                        ["--lldb", "--num-workers", "2"],
+                        packagePath: fixturePath,
+                        configuration: configuration,
+                        buildSystem: buildSystem,
+                    )
+                }
+                guard case let SwiftPMError.executionFailure(_, stdout, stderr) = try #require(error) else {
+                    Issue.record("Incorrect error was raised.")
+                    return
+                }
+
+                #expect(
+                    stderr.contains("error: --lldb cannot be used with --num-workers (debugging requires sequential execution)"),
+                    "got stdout: \(stdout), stderr: \(stderr)",
+                )
+            }
+        }
+
+        @Test(
+            arguments: SupportedBuildSystemOnAllPlatforms, BuildConfiguration.allCases,
+        )
+        func lldbWithListTestsThrowsError(
+            buildSystem: BuildSystemProvider.Kind,
+            configuration: BuildConfiguration,
+        ) async throws {
+            try await fixture(name: "Miscellaneous/EchoExecutable") { fixturePath in
+                let error = await #expect(throws: SwiftPMError.self) {
+                    try await execute(
+                        ["--lldb", "--list-tests"],
+                        packagePath: fixturePath,
+                        configuration: configuration,
+                        buildSystem: buildSystem,
+                    )
+                }
+                guard case let SwiftPMError.executionFailure(_, stdout, stderr) = try #require(error) else {
+                    Issue.record("Incorrect error was raised.")
+                    return
+                }
+
+                #expect(
+                    stderr.contains("error: --lldb cannot be used with --list-tests (use 'swift test list' for listing tests)"),
+                    "got stdout: \(stdout), stderr: \(stderr)",
+                )
+            }
+        }
+
+        @Test(
+            arguments: SupportedBuildSystemOnAllPlatforms, BuildConfiguration.allCases,
+        )
+        func lldbWithShowCodecovPathThrowsError(
+            buildSystem: BuildSystemProvider.Kind,
+            configuration: BuildConfiguration,
+        ) async throws {
+            try await fixture(name: "Miscellaneous/EchoExecutable") { fixturePath in
+                let error = await #expect(throws: SwiftPMError.self) {
+                    try await execute(
+                        ["--lldb", "--show-codecov-path"],
+                        packagePath: fixturePath,
+                        configuration: configuration,
+                        buildSystem: buildSystem,
+                    )
+                }
+                guard case let SwiftPMError.executionFailure(_, stdout, stderr) = try #require(error) else {
+                    Issue.record("Incorrect error was raised.")
+                    return
+                }
+
+                #expect(
+                    stderr.contains("error: --lldb cannot be used with --show-codecov-path (debugging session cannot show paths)"),
+                    "got stdout: \(stdout), stderr: \(stderr)",
+                )
+            }
+        }
+
+        @Test(
+            arguments: SupportedBuildSystemOnAllPlatforms, BuildConfiguration.allCases,
+        )
+        func lldbWithCompatibleFlagsDoesNotThrowValidationError(
+            buildSystem: BuildSystemProvider.Kind,
+            configuration: BuildConfiguration,
+        ) async throws {
+            try await fixture(name: "Miscellaneous/EchoExecutable") { fixturePath in
+                let (stdout, stderr) = try await execute(
+                    ["--lldb", "--filter", ".*", "--skip", "sometest", "--enable-testable-imports"],
+                    packagePath: fixturePath,
+                    configuration: configuration,
+                    buildSystem: buildSystem,
+                )
+
+                // Should not contain validation errors for incompatible flags
+                #expect(
+                    !stderr.contains("error: --lldb cannot be used with"),
+                    "got stdout: \(stdout), stderr: \(stderr)",
+                )
+            }
+        }
+    }
 }
