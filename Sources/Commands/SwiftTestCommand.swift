@@ -575,21 +575,22 @@ public struct SwiftTestCommand: AsyncSwiftCommand {
             print()
         }
 
-        // Run LLDB sessions sequentially for each enabled testing library (XCTest first)
-        for library in librariesToRun {
-            try await runSingleTestLibraryWithLLDB(
-                testProduct: testProduct,
-                library: library,
-                testProducts: testProducts,
-                productsBuildParameters: productsBuildParameters,
-                swiftCommandState: swiftCommandState,
-                toolchain: toolchain,
-                sessionState: DebugSessionState(
-                    libraries: librariesToRun,
-                    activeLibrary: library
-                )
-            )
-        }
+        try await runTestLibrariesWithLLDB(
+            testProduct: testProduct,
+            target: DebuggableTestTarget(
+                libraries: librariesToRun.map {
+                    DebuggableTestTarget.Pairing(
+                        library: $0,
+                        additionalArgs: try additionalLLDBArguments(for: $0, testProducts: testProducts, swiftCommandState: swiftCommandState),
+                        bundlePath: testBundlePath(for: $0, testProduct: testProduct)
+                    )
+                }
+            ),
+            testProducts: testProducts,
+            productsBuildParameters: productsBuildParameters,
+            swiftCommandState: swiftCommandState,
+            toolchain: toolchain
+        )
 
         // Clean up Python script file after all sessions complete
         // (Breakpoint file cleanup is handled by DebugTestRunner based on SessionState)
@@ -605,6 +606,34 @@ public struct SwiftTestCommand: AsyncSwiftCommand {
         return .success
     }
 
+    private func additionalLLDBArguments(for library: TestingLibrary, testProducts: [BuiltTestProduct], swiftCommandState: SwiftCommandState) throws -> [String] {
+        // Determine test binary path and arguments based on the testing library
+        switch library {
+        case .xctest:
+            let (xctestArgs, _) = try xctestArgs(for: testProducts, swiftCommandState: swiftCommandState)
+            return xctestArgs
+
+        case .swiftTesting:
+            let commandLineArguments = CommandLine.arguments.dropFirst()
+            var swiftTestingArgs = ["--testing-library", "swift-testing", "--enable-swift-testing"]
+
+            if let separatorIndex = commandLineArguments.firstIndex(of: "--") {
+                // Only pass arguments after the "--" separator
+                swiftTestingArgs += Array(commandLineArguments.dropFirst(separatorIndex + 1))
+            }
+            return  swiftTestingArgs
+        }
+    }
+
+    private func testBundlePath(for library: TestingLibrary, testProduct: BuiltTestProduct) -> AbsolutePath {
+        switch library {
+        case .xctest:
+            testProduct.bundlePath
+        case .swiftTesting:
+            testProduct.binaryPath
+        }
+    }
+
     /// Runs a single testing library under LLDB debugger.
     ///
     /// - Parameters:
@@ -615,58 +644,28 @@ public struct SwiftTestCommand: AsyncSwiftCommand {
     ///   - swiftCommandState: The Swift command state
     ///   - toolchain: The toolchain to use
     ///   - sessionState: The debugging session state for breakpoint persistence
-    private func runSingleTestLibraryWithLLDB(
+    private func runTestLibrariesWithLLDB(
         testProduct: BuiltTestProduct,
-        library: TestingLibrary,
+        target: DebuggableTestTarget,
         testProducts: [BuiltTestProduct],
         productsBuildParameters: BuildParameters,
         swiftCommandState: SwiftCommandState,
-        toolchain: UserToolchain,
-        sessionState: DebugSessionState
+        toolchain: UserToolchain
     ) async throws {
-        let testBundlePath: AbsolutePath
-        let additionalArgs: [String]
-
-        // Determine test binary path and arguments based on the testing library
-        switch library {
-        case .xctest:
-            testBundlePath = testProduct.bundlePath
-            let (xctestArgs, _) = try xctestArgs(for: testProducts, swiftCommandState: swiftCommandState)
-            additionalArgs = xctestArgs
-
-        case .swiftTesting:
-            testBundlePath = testProduct.binaryPath
-            let commandLineArguments = CommandLine.arguments.dropFirst()
-            var swiftTestingArgs = ["--testing-library", "swift-testing", "--enable-swift-testing"]
-
-            if let separatorIndex = commandLineArguments.firstIndex(of: "--") {
-                // Only pass arguments after the "--" separator
-                swiftTestingArgs += Array(commandLineArguments.dropFirst(separatorIndex + 1))
-            }
-            additionalArgs = swiftTestingArgs
-        }
-
-        guard swiftCommandState.fileSystem.exists(testBundlePath) else {
-            throw StringError("Test binary not found: \(testBundlePath)")
-        }
-
         // Create and launch the debug test runner
         let debugRunner = DebugTestRunner(
-            bundlePath: testBundlePath,
-            additionalArguments: additionalArgs,
-            library: library,
+            target: target,
             buildParameters: productsBuildParameters,
             toolchain: toolchain,
             testEnv: try TestingSupport.constructTestEnvironment(
                 toolchain: toolchain,
                 destinationBuildParameters: productsBuildParameters,
                 sanitizers: globalOptions.build.sanitizers,
-                library: library
+                library: .xctest // TODO
             ),
             cancellator: swiftCommandState.cancellator,
             fileSystem: swiftCommandState.fileSystem,
-            observabilityScope: swiftCommandState.observabilityScope,
-            sessionState: sessionState
+            observabilityScope: swiftCommandState.observabilityScope
         )
 
         // Launch LLDB using AsyncProcess with proper input/output forwarding

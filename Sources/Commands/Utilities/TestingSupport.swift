@@ -37,34 +37,18 @@ import var TSCBasic.stdoutStream
 import func TSCBasic.withTemporaryFile
 import func TSCBasic.exec
 
-/// Represents the state of LLDB debugging sessions for breakpoint persistence.
-struct DebugSessionState {
-    let libraries: [TestingLibrary]
-    let activeLibrary: TestingLibrary
-
-    /// Whether this session should create the Python script for breakpoint persistence
-    var shouldPersistBreakpoints: Bool {
-        isMultiSession && isFirst
+struct DebuggableTestTarget {
+    struct Pairing {
+        let library: TestingLibrary
+        let additionalArgs: [String]
+        let bundlePath: AbsolutePath
     }
 
-    /// Whether this session should load existing breakpoints
-    var shouldLoadBreakpoints: Bool {
-        isMultiSession && isLast
-    }
+    let libraries: [Pairing]
 
     /// Whether this is part of a multi-session sequence
     var isMultiSession: Bool {
         libraries.count > 1
-    }
-
-    /// Whether this is the first session in any sequence
-    var isFirst: Bool {
-        activeLibrary == libraries.first
-    }
-
-    /// Whether this is the last session in any sequence
-    var isLast: Bool {
-        activeLibrary == libraries.last
     }
 }
 
@@ -323,40 +307,31 @@ enum TestingSupport {
 
 /// A class to run tests under LLDB debugger.
 final class DebugTestRunner {
-    private let bundlePath: AbsolutePath
-    private let additionalArguments: [String]
-    private let library: TestingLibrary
+    private let target: DebuggableTestTarget
     private let buildParameters: BuildParameters
     private let toolchain: UserToolchain
     private let testEnv: Environment
     private let cancellator: Cancellator
     private let fileSystem: FileSystem
     private let observabilityScope: ObservabilityScope
-    private let sessionState: DebugSessionState
 
     /// Creates an instance of debug test runner.
     init(
-        bundlePath: AbsolutePath,
-        additionalArguments: [String] = [],
-        library: TestingLibrary,
+        target: DebuggableTestTarget,
         buildParameters: BuildParameters,
         toolchain: UserToolchain,
         testEnv: Environment,
         cancellator: Cancellator,
         fileSystem: FileSystem,
-        observabilityScope: ObservabilityScope,
-        sessionState: DebugSessionState
+        observabilityScope: ObservabilityScope
     ) {
-        self.bundlePath = bundlePath
-        self.additionalArguments = additionalArguments
-        self.library = library
+        self.target = target
         self.buildParameters = buildParameters
         self.toolchain = toolchain
         self.testEnv = testEnv
         self.cancellator = cancellator
         self.fileSystem = fileSystem
         self.observabilityScope = observabilityScope
-        self.sessionState = sessionState
     }
 
     /// Launches the test binary under LLDB for interactive debugging.
@@ -388,93 +363,19 @@ final class DebugTestRunner {
             throw error
         }
 
-        // Validate that the test binary exists
-        guard fileSystem.exists(bundlePath) else {
-            observabilityScope.emit(error: "Test binary not found at: \(bundlePath)")
-            throw FileSystemError(.noEntry, bundlePath)
-        }
-
-        let lldbArgs = try prepareLLDBArguments(for: library)
-
+        let lldbArgs = try prepareLLDBArguments(for: target)
         observabilityScope.emit(info: "LLDB will run: \(lldbPath.pathString) \(lldbArgs.joined(separator: " "))")
-
-        if !additionalArguments.isEmpty {
-            observabilityScope.emit(info: "Additional test arguments: \(additionalArguments.joined(separator: " "))")
-        }
 
         let result = try runInPty(executable: lldbPath.pathString, args: lldbArgs, environment: testEnv)
         if result != 0 {
             observabilityScope.emit(info: "LLDB debugging session exited with code \(result)")
         }
-
-        // Clean up breakpoints file if this is the last session or a single session
-        if sessionState.isLast && sessionState.isMultiSession {
-            let breakpointFile = try breakpointFilePath()
-            try? fileSystem.removeFileTree(breakpointFile)
-        }
     }
 
-    /// Returns the path to the breakpoint persistence file.
-    private func breakpointFilePath() throws -> AbsolutePath {
-        let tempDir = try fileSystem.tempDirectory
-        return tempDir.appending("lldb_breakpoints.txt")
-    }
-
-    /// Returns the path to the Python script file for quit/exit override.
+    /// Returns the path to the Python script file.
     private func pythonScriptFilePath() throws -> AbsolutePath {
         let tempDir = try fileSystem.tempDirectory
-        return tempDir.appending("save_breakpoints.py")
-    }
-
-    /// Creates the Python script that overrides quit and exit commands to save breakpoints.
-    private func createPythonScript() throws -> AbsolutePath {
-        let scriptPath = try pythonScriptFilePath()
-        let breakpointFile = try breakpointFilePath()
-
-        let pythonScript = """
-# autosave_bps.py
-import lldb
-import threading
-import os
-
-OUT_PATH = "\(breakpointFile.pathString)"
-
-def breakpoint_event_loop(listener, debugger):
-    \"\"\"Background thread that listens for breakpoint events.\"\"\"
-    event = lldb.SBEvent()
-
-    while True:
-        if listener.WaitForEvent(5, event):  # timeout prevents blocking forever
-            if lldb.SBBreakpoint.EventIsBreakpointEvent(event):
-                ev_type = lldb.SBBreakpoint.GetBreakpointEventTypeFromEvent(event)
-
-                if ev_type == lldb.eBreakpointEventTypeAdded:
-                    debugger.HandleCommand(f'breakpoint write -f "{OUT_PATH}"')
-
-                elif ev_type == lldb.eBreakpointEventTypeRemoved:
-                    target = debugger.GetSelectedTarget()
-                    if target and target.GetNumBreakpoints() > 0:
-                        debugger.HandleCommand(f'breakpoint write "{OUT_PATH}"')
-                    else:
-                        try:
-                            os.remove(OUT_PATH)
-                        except FileNotFoundError:
-                            pass
-
-def __lldb_init_module(debugger, internal_dict):
-    target = debugger.GetSelectedTarget()
-    if not target:
-        return
-
-    listener = lldb.SBListener("breakpoint_listener")
-    target.GetBroadcaster().AddListener(listener, lldb.SBTarget.eBroadcastBitBreakpointChanged)
-
-    t = threading.Thread(target=breakpoint_event_loop, args=(listener, debugger), daemon=True)
-    t.start()
-"""
-
-        try fileSystem.writeFileContents(scriptPath, string: pythonScript)
-        return scriptPath
+        return tempDir.appending("target_switcher.py")
     }
 
     /// Prepares LLDB arguments for debugging based on the testing library.
@@ -485,107 +386,19 @@ def __lldb_init_module(debugger, internal_dict):
     /// - Parameter library: The testing library being used (XCTest or Swift Testing)
     /// - Returns: Array of LLDB command line arguments
     /// - Throws: Various errors if required tools are not found or file operations fail
-    private func prepareLLDBArguments(for library: TestingLibrary) throws -> [String] {
-        // Determine the target executable and initial program arguments
-        let targetExecutable: AbsolutePath
-        var programArgs: [String] = []
-
-        // switch library {
-        // case .xctest:
-        //     // For XCTest, we need to launch xctest with the bundle as an argument
-        //     guard let xctestPath = toolchain.xctestPath else {
-        //         throw StringError("XCTest not found in toolchain")
-        //     }
-        //     targetExecutable = xctestPath
-        //     programArgs = [bundlePath.pathString]
-
-        // case .swiftTesting:
-        //     // For Swift Testing, use swiftpm-testing-helper with --test-bundle-path
-        //     #if os(macOS)
-        //     targetExecutable = try toolchain.getSwiftTestingHelper()
-        //     programArgs = ["--test-bundle-path", bundlePath.pathString]
-        //     #else
-        //     targetExecutable = bundlePath
-        //     #endif
-        // }
-        // Implementation taken from SwiftTestCommand.swift -> TestRunner.args(forTestAt:), should be refactored
-        #if os(macOS)
-            switch library {
-            case .xctest:
-                guard let xctestPath = self.toolchain.xctestPath else {
-                    throw TestError.xcodeNotInstalled
-                }
-                targetExecutable = xctestPath
-            case .swiftTesting:
-                targetExecutable = try self.toolchain.getSwiftTestingHelper()
-                programArgs += ["--test-bundle-path", bundlePath.pathString]
-            }
-            programArgs += self.additionalArguments
-        #else
-            targetExecutable = bundlePath
-            programArgs += self.additionalArguments
-        #endif
-
-        // Add any additional arguments
-        // programArgs.append(contentsOf: additionalArguments)
-
+    private func prepareLLDBArguments(for target: DebuggableTestTarget) throws -> [String] {
         // Create a temporary LLDB command file for batch execution
         let tempDir = try fileSystem.tempDirectory
         let lldbCommandFile = tempDir.appending("lldb-commands.txt")
 
-        // Build LLDB commands
-        var lldbCommands = [
-            "target create \(targetExecutable.pathString)",
-            "settings clear target.run-args"
-        ]
+        // Build LLDB commands for multi-target setup
+        var lldbCommands: [String] = []
 
-        // Add each argument individually using settings append to avoid -- parsing issues
-        for arg in programArgs {
-            lldbCommands.append("settings append target.run-args \"\(arg)\"")
-        }
-
-        // Determine the module path for symbol loading
-        var modulePath = bundlePath
-        if library == .xctest && buildParameters.triple.isDarwin() {
-            guard let name = bundlePath.components.last?.replacing(".xctest", with: "") else {
-                throw InternalError("Invalid bundle path: \(bundlePath)")
-            }
-            modulePath = bundlePath.appending(try RelativePath(validating: "Contents/MacOS/\(name)"))
-        }
-
-        // Pre-load the test bundle symbols so breakpoints on test functions work
-        lldbCommands.append("target modules add \"\(modulePath.pathString)\"")
-
-        // Add breakpoint persistence support
-        if sessionState.shouldPersistBreakpoints {
-            // Ensure there is no leftover breakpoints file from a previous run
-            let breakpointFile = try breakpointFilePath()
-            try? fileSystem.removeFileTree(breakpointFile)
-
-            let scriptPath = try createPythonScript()
-            lldbCommands.append("command script import \"\(scriptPath.pathString)\"")
-        }
-
-        // Load breakpoints from previous session
-        if sessionState.shouldLoadBreakpoints {
-            let breakpointFile = try breakpointFilePath()
-            if fileSystem.exists(breakpointFile) {
-                lldbCommands.append("breakpoint read -f \"\(breakpointFile.pathString)\"")
-            }
-        }
-
-        // Clear the screen of the commands we've already run, and if we're running multiple
-        // sessions print what testing library we're using to help orient the user.
-        if sessionState.isMultiSession {
-            let libraryNames = sessionState.libraries.map { $0 == .xctest ? "XCTest" : "Swift Testing" }
-            let libraryName = library == .xctest ? "XCTest" : "Swift Testing"
-            let activeLibraries = sessionState.isLast ? "" : "Multiple testing libraries are enabled: \(libraryNames.joined(separator: " and "))\\n"
-            let startingSession = "Starting LLDB debugging session for \(libraryName) tests..."
-            let exitMessage = sessionState.isLast ? "" : "\\nUse \\`quit\\` or \\`exit\\` to terminate the LLDB session and begin debugging \(libraryNames.last!)"
-            let message = "\\n\\n\(activeLibraries)\(startingSession)\(exitMessage)\\n\\n"
-            lldbCommands.append("script print(\"\\033[H\\033[J\(message)\", end=\"\")")
+        // If we have multiple libraries, set up both targets
+        if target.isMultiSession {
+            try setupMultipleTargets(&lldbCommands)
         } else {
-            lldbCommands.append("script print(\"\\033[H\\033[J\", end=\"\")")
+            try setupSingleTarget(&lldbCommands, for: target.libraries.first!)
         }
 
         // Write commands to file
@@ -594,6 +407,162 @@ def __lldb_init_module(debugger, internal_dict):
 
         // Return script file arguments without batch mode to allow interactive debugging
         return ["-s", lldbCommandFile.pathString]
+    }
+
+    /// Sets up multiple targets when both XCTest and Swift Testing are available
+    private func setupMultipleTargets(_ lldbCommands: inout [String]) throws {
+        var targetIndex = 0
+
+        // Create targets for each testing library
+        for testingLibrary in target.libraries {
+            let (executable, args) = try getExecutableAndArgs(for: testingLibrary)
+            // Create target
+            lldbCommands.append("target create \(executable.pathString)")
+            lldbCommands.append("settings clear target.run-args")
+
+            // Add arguments
+            for arg in args {
+                lldbCommands.append("settings append target.run-args \"\(arg)\"")
+            }
+
+            // Determine the module path for symbol loading
+            let modulePath = getModulePath(for: testingLibrary)
+
+            // Pre-load the test bundle symbols so breakpoints on test functions work
+            lldbCommands.append("target modules add \"\(modulePath.pathString)\"")
+
+            targetIndex += 1
+        }
+
+        // Create the target switching Python script
+        let scriptPath = try createTargetSwitchingScript()
+        lldbCommands.append("command script import \"\(scriptPath.pathString)\"")
+
+        // Select the first target and launch with pause on main
+        lldbCommands.append("target select 0")
+        lldbCommands.append("script print(\"\\033[H\\033[J\", end=\"\")")
+    }
+
+    /// Sets up a single target when only one testing library is available
+    private func setupSingleTarget(_ lldbCommands: inout [String], for target: DebuggableTestTarget.Pairing) throws {
+        let (executable, args) = try getExecutableAndArgs(for: target)
+        // Create target
+        lldbCommands.append("target create \(executable.pathString)")
+        lldbCommands.append("settings clear target.run-args")
+
+        // Add arguments
+        for arg in args {
+            lldbCommands.append("settings append target.run-args \"\(arg)\"")
+        }
+
+        // Load symbols for the test bundle
+        let modulePath = getModulePath(for: target)
+        lldbCommands.append("target modules add \"\(modulePath.pathString)\"")
+
+        // Clear screen and show ready message
+        // lldbCommands.append("script print(\"\\033[H\\033[J\", end=\"\")")
+        let libraryName = target.library == .xctest ? "XCTest" : "Swift Testing"
+        let message = "\\n\\nStarting LLDB debugging session for \(libraryName) tests...\\n\\n"
+        lldbCommands.append("script print(\"\(message)\", end=\"\")")
+    }
+
+    /// Gets the executable path and arguments for a given testing library
+    private func getExecutableAndArgs(for target: DebuggableTestTarget.Pairing) throws -> (AbsolutePath, [String]) {
+        switch target.library {
+        case .xctest:
+            guard let xctestPath = toolchain.xctestPath else {
+                throw StringError("XCTest not found in toolchain")
+            }
+            return (xctestPath, [target.bundlePath.pathString] + target.additionalArgs)
+
+        case .swiftTesting:
+            #if os(macOS)
+            let executable = try toolchain.getSwiftTestingHelper()
+            let args = ["--test-bundle-path", target.bundlePath.pathString] + target.additionalArgs
+            #else
+            let executable = target.bundlePath
+            let args = target.additionalArgs
+            #endif
+            return (executable, args)
+        }
+    }
+
+    /// Gets the module path for symbol loading
+    private func getModulePath(for target: DebuggableTestTarget.Pairing) -> AbsolutePath {
+        var modulePath = target.bundlePath
+        if target.library == .xctest && buildParameters.triple.isDarwin() {
+            if let name = target.bundlePath.components.last?.replacing(".xctest", with: "") {
+                if let relativePath = try? RelativePath(validating: "Contents/MacOS/\(name)") {
+                    modulePath = target.bundlePath.appending(relativePath)
+                }
+            }
+        }
+        return modulePath
+    }
+
+    /// Creates a Python script that handles automatic target switching
+    private func createTargetSwitchingScript() throws -> AbsolutePath {
+        let scriptPath = try pythonScriptFilePath()
+
+        let pythonScript = """
+# target_switcher.py
+import lldb
+import threading
+import time
+
+current_target_index = 0
+max_targets = 0
+debugger_ref = None
+
+def check_process_status():
+    \"\"\"Periodically check if the current process has exited.\"\"\"
+    global current_target_index, max_targets, debugger_ref
+
+    while current_target_index < max_targets:
+        if debugger_ref:
+            target = debugger_ref.GetSelectedTarget()
+            if target:
+                process = target.GetProcess()
+                if process and process.GetState() == lldb.eStateExited:
+                    # Process has exited, trigger switch
+                    current_target_index += 1
+
+                    if current_target_index < max_targets:
+                        # Switch to next target and launch immediately
+                        debugger_ref.HandleCommand(f'target select {current_target_index}')
+
+                        # Get target name for user feedback
+                        new_target = debugger_ref.GetSelectedTarget()
+                        target_name = new_target.GetExecutable().GetFilename() if new_target else "Unknown"
+
+                        print(f"\\n\\n=== Switching to next target: {target_name} ===")
+                        print("Launching next testing framework automatically...")
+
+                        # Launch the next target immediately with pause on main
+                        debugger_ref.HandleCommand('process launch') # -m to pause on main
+                    else:
+                        print("\\n\\nAll testing targets completed.")
+                        return
+
+        time.sleep(1)  # Check every second
+
+def __lldb_init_module(debugger, internal_dict):
+    global max_targets, debugger_ref
+
+    debugger_ref = debugger
+
+    # Count the number of targets
+    max_targets = debugger.GetNumTargets()
+
+    if max_targets > 1:
+        print(f"\\n=== Multi-target debugging session initialized ===")
+        # Start the process status checker
+        t = threading.Thread(target=check_process_status, daemon=True)
+        t.start()
+"""
+
+        try fileSystem.writeFileContents(scriptPath, string: pythonScript)
+        return scriptPath
     }
 
     /// Runs an executable in a pseudo-terminal (PTY) with proper terminal interaction support.
