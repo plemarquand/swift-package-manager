@@ -513,6 +513,99 @@ import time
 current_target_index = 0
 max_targets = 0
 debugger_ref = None
+known_breakpoints = set()
+
+def sync_breakpoints_to_target(source_target, dest_target):
+    \"\"\"Synchronize breakpoints from source target to destination target.\"\"\"
+    if not source_target or not dest_target:
+        return
+
+    # Get all breakpoints from source target
+    for i in range(source_target.GetNumBreakpoints()):
+        bp = source_target.GetBreakpointAtIndex(i)
+        if not bp.IsValid():
+            continue
+
+        # Check if this is a new breakpoint we haven't seen before
+        bp_id = (bp.GetLocationAtIndex(0).GetAddress().GetFileAddress() if bp.GetNumLocations() > 0 else 0)
+
+        # For each location in the breakpoint
+        for j in range(bp.GetNumLocations()):
+            location = bp.GetLocationAtIndex(j)
+            if not location.IsValid():
+                continue
+
+            addr = location.GetAddress()
+            line_entry = addr.GetLineEntry()
+
+            if line_entry.IsValid():
+                file_spec = line_entry.GetFileSpec()
+                line_number = line_entry.GetLine()
+
+                # Create the same breakpoint in the destination target
+                new_bp = dest_target.BreakpointCreateByLocation(file_spec, line_number)
+                if new_bp.IsValid():
+                    # Copy breakpoint properties
+                    new_bp.SetEnabled(bp.IsEnabled())
+                    new_bp.SetCondition(bp.GetCondition())
+                    new_bp.SetIgnoreCount(bp.GetIgnoreCount())
+
+                    # Copy hit count if possible (read-only property, so we can't actually set it)
+            else:
+                # Handle function name breakpoints
+                for k in range(bp.GetNumLocations()):
+                    loc = bp.GetLocationAtIndex(k)
+                    if loc.IsValid():
+                        symbol = loc.GetAddress().GetSymbol()
+                        if symbol.IsValid():
+                            symbol_name = symbol.GetName()
+                            if symbol_name:
+                                new_bp = dest_target.BreakpointCreateByName(symbol_name)
+                                if new_bp.IsValid():
+                                    new_bp.SetEnabled(bp.IsEnabled())
+                                    new_bp.SetCondition(bp.GetCondition())
+                                    new_bp.SetIgnoreCount(bp.GetIgnoreCount())
+                                break
+
+def sync_breakpoints_to_all_targets():
+    \"\"\"Synchronize breakpoints from current target to all other targets.\"\"\"
+    global debugger_ref, max_targets
+
+    if not debugger_ref or max_targets <= 1:
+        return
+
+    current_target = debugger_ref.GetSelectedTarget()
+    if not current_target:
+        return
+
+    # Sync to all other targets
+    for i in range(max_targets):
+        target = debugger_ref.GetTargetAtIndex(i)
+        if target and target != current_target:
+            sync_breakpoints_to_target(current_target, target)
+
+def monitor_breakpoints():
+    \"\"\"Monitor breakpoint changes and sync them across targets.\"\"\"
+    global debugger_ref, known_breakpoints, max_targets
+
+    if max_targets <= 1:
+        return
+
+    last_breakpoint_count = 0
+
+    while current_target_index < max_targets:
+        if debugger_ref:
+            current_target = debugger_ref.GetSelectedTarget()
+            if current_target:
+                current_bp_count = current_target.GetNumBreakpoints()
+
+                # If breakpoint count changed, sync to all targets
+                if current_bp_count != last_breakpoint_count:
+                    time.sleep(0.1)  # Small delay to ensure breakpoint is fully created
+                    sync_breakpoints_to_all_targets()
+                    last_breakpoint_count = current_bp_count
+
+        time.sleep(0.5)  # Check every 500ms
 
 def check_process_status():
     \"\"\"Periodically check if the current process has exited.\"\"\"
@@ -537,6 +630,7 @@ def check_process_status():
 
                         print(f"\\n\\n=== Switching to next target: {target_name} ===")
                         print("Launching next testing framework automatically...")
+                        print("All previously set breakpoints have been synchronized to this target.")
 
                         # Launch the next target immediately with pause on main
                         debugger_ref.HandleCommand('process launch') # -m to pause on main
@@ -556,9 +650,15 @@ def __lldb_init_module(debugger, internal_dict):
 
     if max_targets > 1:
         print(f"\\n=== Multi-target debugging session initialized ===")
+        print("Breakpoints set on any target will be automatically synchronized to all targets.")
+
         # Start the process status checker
-        t = threading.Thread(target=check_process_status, daemon=True)
-        t.start()
+        status_thread = threading.Thread(target=check_process_status, daemon=True)
+        status_thread.start()
+
+        # Start the breakpoint monitor
+        bp_thread = threading.Thread(target=monitor_breakpoints, daemon=True)
+        bp_thread.start()
 """
 
         try fileSystem.writeFileContents(scriptPath, string: pythonScript)
