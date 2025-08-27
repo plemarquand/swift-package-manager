@@ -17,7 +17,18 @@ import PackageModel
 import SPMBuildCore
 import TSCUtility
 import Workspace
+
+#if canImport(WinSDK)
+import WinSDK
+#elseif canImport(Darwin)
 import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#elseif canImport(Bionic)
+import Bionic
+#endif
 
 import struct TSCBasic.FileSystemError
 import class Basics.AsyncProcess
@@ -477,25 +488,46 @@ def __lldb_init_module(debugger, internal_dict):
     private func prepareLLDBArguments(for library: TestingLibrary) throws -> [String] {
         // Determine the target executable and initial program arguments
         let targetExecutable: AbsolutePath
-        var programArgs: [String]
+        var programArgs: [String] = []
 
-        switch library {
-        case .xctest:
-            // For XCTest, we need to launch xctest with the bundle as an argument
-            guard let xctestPath = toolchain.xctestPath else {
-                throw StringError("XCTest not found in toolchain")
+        // switch library {
+        // case .xctest:
+        //     // For XCTest, we need to launch xctest with the bundle as an argument
+        //     guard let xctestPath = toolchain.xctestPath else {
+        //         throw StringError("XCTest not found in toolchain")
+        //     }
+        //     targetExecutable = xctestPath
+        //     programArgs = [bundlePath.pathString]
+
+        // case .swiftTesting:
+        //     // For Swift Testing, use swiftpm-testing-helper with --test-bundle-path
+        //     #if os(macOS)
+        //     targetExecutable = try toolchain.getSwiftTestingHelper()
+        //     programArgs = ["--test-bundle-path", bundlePath.pathString]
+        //     #else
+        //     targetExecutable = bundlePath
+        //     #endif
+        // }
+        // Implementation taken from SwiftTestCommand.swift -> TestRunner.args(forTestAt:), should be refactored
+        #if os(macOS)
+            switch library {
+            case .xctest:
+                guard let xctestPath = self.toolchain.xctestPath else {
+                    throw TestError.xcodeNotInstalled
+                }
+                targetExecutable = xctestPath
+            case .swiftTesting:
+                targetExecutable = try self.toolchain.getSwiftTestingHelper()
+                programArgs += ["--test-bundle-path", bundlePath.pathString]
             }
-            targetExecutable = xctestPath
-            programArgs = [bundlePath.pathString]
-
-        case .swiftTesting:
-            // For Swift Testing, use swiftpm-testing-helper with --test-bundle-path
-            targetExecutable = try toolchain.getSwiftTestingHelper()
-            programArgs = ["--test-bundle-path", bundlePath.pathString]
-        }
+            programArgs += self.additionalArguments
+        #else
+            targetExecutable = bundlePath
+            programArgs += self.additionalArguments
+        #endif
 
         // Add any additional arguments
-        programArgs.append(contentsOf: additionalArguments)
+        // programArgs.append(contentsOf: additionalArguments)
 
         // Create a temporary LLDB command file for batch execution
         let tempDir = try fileSystem.tempDirectory
@@ -600,7 +632,7 @@ def __lldb_init_module(debugger, internal_dict):
         var masterFD: Int32 = -1
         var slaveFD: Int32 = -1
         var winSize = winsize()
-        if ioctl(STDIN_FILENO, TIOCGWINSZ, &winSize) == -1 {
+        if ioctl(STDIN_FILENO, UInt(TIOCGWINSZ), &winSize) == -1 {
             // fallback if not a tty
             winSize = winsize(ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0)
         }
@@ -620,6 +652,8 @@ def __lldb_init_module(debugger, internal_dict):
         }
         envp.append(nil)
 
+        #if os(macOS)
+        // On macOS, posix_spawn uses optional types
         var fileActions: posix_spawn_file_actions_t?
         posix_spawn_file_actions_init(&fileActions)
         posix_spawn_file_actions_adddup2(&fileActions, slaveFD, STDIN_FILENO)
@@ -629,13 +663,33 @@ def __lldb_init_module(debugger, internal_dict):
         var attr: posix_spawnattr_t?
         posix_spawnattr_init(&attr)
         posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSID))
+        #else
+        // On Linux, posix_spawn uses non-optional types
+        var fileActions = posix_spawn_file_actions_t()
+        posix_spawn_file_actions_init(&fileActions)
+        posix_spawn_file_actions_adddup2(&fileActions, slaveFD, STDIN_FILENO)
+        posix_spawn_file_actions_adddup2(&fileActions, slaveFD, STDOUT_FILENO)
+        posix_spawn_file_actions_adddup2(&fileActions, slaveFD, STDERR_FILENO)
+
+        var attr = posix_spawnattr_t()
+        posix_spawnattr_init(&attr)
+        // On Linux, POSIX_SPAWN_SETSID might not be available, use 0 for now
+        posix_spawnattr_setflags(&attr, 0)
+        #endif
 
         // Clear the screen
         print("\u{1B}[2J\u{1B}[H", terminator: "")
 
         var pid: pid_t = 0
+        #if os(macOS)
         let spawnResult = posix_spawn(&pid, executable, &fileActions, &attr, &argv, &envp)
         posix_spawn_file_actions_destroy(&fileActions)
+        posix_spawnattr_destroy(&attr)
+        #else
+        let spawnResult = posix_spawn(&pid, executable, &fileActions, &attr, &argv, &envp)
+        posix_spawn_file_actions_destroy(&fileActions)
+        posix_spawnattr_destroy(&attr)
+        #endif
         argv.forEach { free($0) }
         envp.forEach { free($0) }
 
