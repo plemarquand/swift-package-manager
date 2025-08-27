@@ -387,21 +387,16 @@ final class DebugTestRunner {
     /// - Returns: Array of LLDB command line arguments
     /// - Throws: Various errors if required tools are not found or file operations fail
     private func prepareLLDBArguments(for target: DebuggableTestTarget) throws -> [String] {
-        // Create a temporary LLDB command file for batch execution
         let tempDir = try fileSystem.tempDirectory
         let lldbCommandFile = tempDir.appending("lldb-commands.txt")
 
-        // Build LLDB commands for multi-target setup
         var lldbCommands: [String] = []
-
-        // If we have multiple libraries, set up both targets
         if target.isMultiSession {
             try setupMultipleTargets(&lldbCommands)
         } else {
             try setupSingleTarget(&lldbCommands, for: target.libraries.first!)
         }
 
-        // Write commands to file
         let commandScript = lldbCommands.joined(separator: "\n")
         try fileSystem.writeFileContents(lldbCommandFile, string: commandScript)
 
@@ -411,27 +406,17 @@ final class DebugTestRunner {
 
     /// Sets up multiple targets when both XCTest and Swift Testing are available
     private func setupMultipleTargets(_ lldbCommands: inout [String]) throws {
-        var targetIndex = 0
-
-        // Create targets for each testing library
         for testingLibrary in target.libraries {
             let (executable, args) = try getExecutableAndArgs(for: testingLibrary)
-            // Create target
             lldbCommands.append("target create \(executable.pathString)")
             lldbCommands.append("settings clear target.run-args")
 
-            // Add arguments
             for arg in args {
                 lldbCommands.append("settings append target.run-args \"\(arg)\"")
             }
 
-            // Determine the module path for symbol loading
             let modulePath = getModulePath(for: testingLibrary)
-
-            // Pre-load the test bundle symbols so breakpoints on test functions work
             lldbCommands.append("target modules add \"\(modulePath.pathString)\"")
-
-            targetIndex += 1
         }
 
         // Create the target switching Python script
@@ -460,7 +445,7 @@ final class DebugTestRunner {
         lldbCommands.append("target modules add \"\(modulePath.pathString)\"")
 
         // Clear screen and show ready message
-        // lldbCommands.append("script print(\"\\033[H\\033[J\", end=\"\")")
+        lldbCommands.append("script print(\"\\033[H\\033[J\", end=\"\")")
         let libraryName = target.library == .xctest ? "XCTest" : "Swift Testing"
         let message = "\\n\\nStarting LLDB debugging session for \(libraryName) tests...\\n\\n"
         lldbCommands.append("script print(\"\(message)\", end=\"\")")
@@ -509,16 +494,48 @@ final class DebugTestRunner {
 import lldb
 import threading
 import time
+import sys
 
 current_target_index = 0
 max_targets = 0
 debugger_ref = None
 known_breakpoints = set()
+sequence_active = True  # Start active by default
 
 def sync_breakpoints_to_target(source_target, dest_target):
     \"\"\"Synchronize breakpoints from source target to destination target.\"\"\"
     if not source_target or not dest_target:
         return
+
+    def breakpoint_exists_in_target(target, file_spec, line_number, symbol_name=None):
+        \"\"\"Check if a breakpoint already exists in the target.\"\"\"
+        for i in range(target.GetNumBreakpoints()):
+            existing_bp = target.GetBreakpointAtIndex(i)
+            if not existing_bp.IsValid():
+                continue
+
+            for j in range(existing_bp.GetNumLocations()):
+                existing_location = existing_bp.GetLocationAtIndex(j)
+                if not existing_location.IsValid():
+                    continue
+
+                existing_addr = existing_location.GetAddress()
+                existing_line_entry = existing_addr.GetLineEntry()
+
+                if existing_line_entry.IsValid() and file_spec and line_number:
+                    # Check line breakpoints
+                    existing_file_spec = existing_line_entry.GetFileSpec()
+                    existing_line_number = existing_line_entry.GetLine()
+
+                    if (existing_file_spec.GetFilename() == file_spec.GetFilename() and
+                        existing_line_number == line_number):
+                        return True
+                elif symbol_name:
+                    # Check function name breakpoints
+                    existing_symbol = existing_addr.GetSymbol()
+                    if existing_symbol.IsValid() and existing_symbol.GetName() == symbol_name:
+                        return True
+        return False
 
     # Get all breakpoints from source target
     for i in range(source_target.GetNumBreakpoints()):
@@ -542,6 +559,10 @@ def sync_breakpoints_to_target(source_target, dest_target):
                 file_spec = line_entry.GetFileSpec()
                 line_number = line_entry.GetLine()
 
+                # Check if this breakpoint already exists in destination target
+                if breakpoint_exists_in_target(dest_target, file_spec, line_number):
+                    continue
+
                 # Create the same breakpoint in the destination target
                 new_bp = dest_target.BreakpointCreateByLocation(file_spec, line_number)
                 if new_bp.IsValid():
@@ -560,6 +581,12 @@ def sync_breakpoints_to_target(source_target, dest_target):
                         if symbol.IsValid():
                             symbol_name = symbol.GetName()
                             if symbol_name:
+                                # Check if this function breakpoint already exists
+                                if breakpoint_exists_in_target(dest_target, None, None, symbol_name):
+                                    print(f"Function breakpoint already exists for {symbol_name}, skipping")
+                                    continue
+
+                                print(f"Creating function breakpoint for {symbol_name}")
                                 new_bp = dest_target.BreakpointCreateByName(symbol_name)
                                 if new_bp.IsValid():
                                     new_bp.SetEnabled(bp.IsEnabled())
@@ -593,7 +620,7 @@ def monitor_breakpoints():
 
     last_breakpoint_count = 0
 
-    while current_target_index < max_targets:
+    while True:  # Keep running forever, not just while current_target_index < max_targets
         if debugger_ref:
             current_target = debugger_ref.GetSelectedTarget()
             if current_target:
@@ -601,7 +628,6 @@ def monitor_breakpoints():
 
                 # If breakpoint count changed, sync to all targets
                 if current_bp_count != last_breakpoint_count:
-                    time.sleep(0.1)  # Small delay to ensure breakpoint is fully created
                     sync_breakpoints_to_all_targets()
                     last_breakpoint_count = current_bp_count
 
@@ -609,36 +635,59 @@ def monitor_breakpoints():
 
 def check_process_status():
     \"\"\"Periodically check if the current process has exited.\"\"\"
-    global current_target_index, max_targets, debugger_ref
+    global current_target_index, max_targets, debugger_ref, sequence_active
 
-    while current_target_index < max_targets:
+    while True:  # Keep running forever, don't exit
         if debugger_ref:
             target = debugger_ref.GetSelectedTarget()
             if target:
                 process = target.GetProcess()
                 if process and process.GetState() == lldb.eStateExited:
-                    # Process has exited, trigger switch
-                    current_target_index += 1
+                    # Process has exited
+                    if sequence_active and current_target_index < max_targets:
+                        # We're in an active sequence, trigger switch
+                        current_target_index += 1
 
-                    if current_target_index < max_targets:
-                        # Switch to next target and launch immediately
-                        debugger_ref.HandleCommand(f'target select {current_target_index}')
+                        if current_target_index < max_targets:
+                            # Switch to next target and launch immediately
+                            print("\\n")
+                            debugger_ref.HandleCommand(f'target select {current_target_index}')
+                            print(" ")
 
-                        # Get target name for user feedback
-                        new_target = debugger_ref.GetSelectedTarget()
-                        target_name = new_target.GetExecutable().GetFilename() if new_target else "Unknown"
+                            # Get target name for user feedback
+                            new_target = debugger_ref.GetSelectedTarget()
+                            target_name = new_target.GetExecutable().GetFilename() if new_target else "Unknown"
 
-                        print(f"\\n\\n=== Switching to next target: {target_name} ===")
-                        print("Launching next testing framework automatically...")
-                        print("All previously set breakpoints have been synchronized to this target.")
+                            # Launch the next target immediately with pause on main
+                            debugger_ref.HandleCommand('process launch') # -m to pause on main
+                        else:
+                            # Reset to first target and deactivate sequence until user runs again
+                            current_target_index = 0
+                            sequence_active = False  # Pause automatic switching
 
-                        # Launch the next target immediately with pause on main
-                        debugger_ref.HandleCommand('process launch') # -m to pause on main
-                    else:
-                        print("\\n\\nAll testing targets completed.")
-                        return
+                            print("\\n")
+                            debugger_ref.HandleCommand('target select 0')
+                            print("\\nAll testing targets completed.")
+                            print("Type 'run' to restart the entire test sequence from the beginning.\\n")
 
-        time.sleep(1)  # Check every second
+                            # Clear the current line and move cursor to start
+                            sys.stdout.write("\\033[2K\\r")
+                            # Reprint a fake prompt (optional)
+                            sys.stdout.write("(lldb) ")
+                            sys.stdout.flush()
+                elif process and process.GetState() in [lldb.eStateRunning, lldb.eStateLaunching]:
+                    # Process is running - if sequence was inactive, reactivate it
+                    if not sequence_active:
+                        sequence_active = True
+                        # Find which target is currently selected to set the correct index
+                        selected_target = debugger_ref.GetSelectedTarget()
+                        if selected_target:
+                            for i in range(max_targets):
+                                if debugger_ref.GetTargetAtIndex(i) == selected_target:
+                                    current_target_index = i
+                                    break
+
+        time.sleep(0.1)  # Check every second
 
 def __lldb_init_module(debugger, internal_dict):
     global max_targets, debugger_ref
@@ -649,9 +698,6 @@ def __lldb_init_module(debugger, internal_dict):
     max_targets = debugger.GetNumTargets()
 
     if max_targets > 1:
-        print(f"\\n=== Multi-target debugging session initialized ===")
-        print("Breakpoints set on any target will be automatically synchronized to all targets.")
-
         # Start the process status checker
         status_thread = threading.Thread(target=check_process_status, daemon=True)
         status_thread.start()
