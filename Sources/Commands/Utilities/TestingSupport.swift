@@ -491,10 +491,14 @@ final class DebugTestRunner {
     private func getExecutableAndArgs(for target: DebuggableTestTarget.Pairing) throws -> (AbsolutePath, [String]) {
         switch target.library {
         case .xctest:
+            #if os(macOS)
             guard let xctestPath = toolchain.xctestPath else {
                 throw StringError("XCTest not found in toolchain")
             }
             return (xctestPath, [target.bundlePath.pathString] + target.additionalArgs)
+            #else
+            return (target.bundlePath, target.additionalArgs)
+            #endif
 
         case .swiftTesting:
             #if os(macOS)
