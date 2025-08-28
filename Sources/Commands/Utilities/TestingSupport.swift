@@ -24,10 +24,6 @@ import WinSDK
 import Darwin
 #elseif canImport(Glibc)
 import Glibc
-#elseif canImport(Musl)
-import Musl
-#elseif canImport(Bionic)
-import Bionic
 #endif
 
 import struct TSCBasic.FileSystemError
@@ -871,12 +867,16 @@ def __lldb_init_module(debugger, internal_dict):
         // Relay loop using poll()
         var fds: [pollfd] = [
             pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0),
-            pollfd(fd: masterFD, events: Int16(POLLIN), revents: 0)
+            pollfd(fd: masterFD, events: Int16(POLLIN | POLLHUP), revents: 0)
         ]
 
         var buf = [UInt8](repeating: 0, count: 1024)
         relay: while true {
-            let ready = poll(&fds, nfds_t(fds.count), -1)
+            // Reset revents for each poll call
+            fds[0].revents = 0
+            fds[1].revents = 0
+
+            let ready = poll(&fds, nfds_t(fds.count), 1000) // 1 second timeout
             if ready > 0 {
                 // Input from user → child
                 if (fds[0].revents & Int16(POLLIN)) != 0 {
@@ -894,6 +894,22 @@ def __lldb_init_module(debugger, internal_dict):
                         break relay // child closed
                     }
                 }
+                // Check for hangup on master FD (child process exited)
+                if (fds[1].revents & Int16(POLLHUP)) != 0 {
+                    break relay
+                }
+            } else if ready == 0 {
+                // Timeout - check if child process has exited
+                var childStatus: Int32 = 0
+                let result = waitpid(pid, &childStatus, WNOHANG)
+                if result == pid {
+                    // Child has exited
+                    break relay
+                } else if result == -1 && errno == ECHILD {
+                    // Child no longer exists
+                    break relay
+                }
+                // Continue polling if child is still alive
             } else {
                 break relay
             }
@@ -903,7 +919,11 @@ def __lldb_init_module(debugger, internal_dict):
         tcsetattr(STDIN_FILENO, TCSANOW, &origTerm)
 
         var status: Int32 = 0
-        waitpid(pid, &status, 0)
+        let waitResult = waitpid(pid, &status, WNOHANG)
+        if waitResult == 0 {
+            // Child is still running, wait for it
+            waitpid(pid, &status, 0)
+        }
         return status
     }
 }
