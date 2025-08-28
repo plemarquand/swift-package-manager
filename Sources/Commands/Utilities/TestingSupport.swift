@@ -362,10 +362,15 @@ final class DebugTestRunner {
         let lldbArgs = try prepareLLDBArguments(for: target)
         observabilityScope.emit(info: "LLDB will run: \(lldbPath.pathString) \(lldbArgs.joined(separator: " "))")
 
-        let result = try runInPty(executable: lldbPath.pathString, args: lldbArgs, environment: testEnv)
-        if result != 0 {
-            observabilityScope.emit(info: "LLDB debugging session exited with code \(result)")
+        // Set environment variables from testEnv on the current process
+        // so they are inherited by the exec'd LLDB process
+        for (key, value) in testEnv {
+            setenv(key.rawValue, value, 1)
         }
+
+        // On Linux, use exec to replace the current process with LLDB
+        // This avoids PTY issues that interfere with LLDB's command line editing
+        try exec(path: lldbPath.pathString, args: [lldbPath.pathString] + lldbArgs)
     }
 
     /// Returns the path to the Python script file.
@@ -752,179 +757,6 @@ def __lldb_init_module(debugger, internal_dict):
 
         try fileSystem.writeFileContents(scriptPath, string: pythonScript)
         return scriptPath
-    }
-
-    /// Runs an executable in a pseudo-terminal (PTY) with proper terminal interaction support.
-    ///
-    /// This function is necessary for running interactive terminal applications like LLDB that require
-    /// full terminal control features. We cannot use simpler approaches because:
-    ///
-    /// 1. **execv() limitation**: execv() would replace the current swift-package-manager process entirely,
-    ///    preventing us from running multiple testing libraries sequentially or showing completion messages.
-    ///
-    /// 2. **Simple stdin/stdout/stderr redirection limitation**: LLDB is a full-screen terminal application
-    ///    that uses advanced terminal features including:
-    ///    - ANSI escape sequences for cursor positioning and screen control
-    ///    - Raw terminal mode for immediate character input (no line buffering)
-    ///    - Terminal size detection and dynamic resizing
-    ///    - Color output and text formatting
-    ///    - Interactive command line editing with history
-    ///
-    /// 3. **PTY solution**: A pseudo-terminal provides a complete terminal emulation layer that:
-    ///    - Presents as a real terminal to the child process (LLDB)
-    ///    - Handles all terminal control sequences properly
-    ///    - Supports raw mode input for immediate character processing
-    ///    - Maintains proper terminal state and signal handling
-    ///    - Allows the parent process to remain in control while providing full terminal functionality
-    ///
-    /// The implementation uses posix_spawn with file descriptor redirection to connect the child process
-    /// to the PTY slave, while the parent process relays data between the user's terminal and the PTY master.
-    ///
-    /// - Parameters:
-    ///   - executable: Path to the executable to run
-    ///   - args: Command line arguments to pass to the executable
-    ///   - environment: Environment variables to set for the child process
-    /// - Returns: Exit status of the child process
-    /// - Throws: System errors related to PTY creation or process spawning
-    func runInPty(executable: String, args: [String], environment: Environment) throws -> Int32 {
-        var masterFD: Int32 = -1
-        var slaveFD: Int32 = -1
-        var winSize = winsize()
-        if ioctl(STDIN_FILENO, UInt(TIOCGWINSZ), &winSize) == -1 {
-            // fallback if not a tty
-            winSize = winsize(ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0)
-        }
-
-        if openpty(&masterFD, &slaveFD, nil, nil, &winSize) == -1 {
-            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
-        }
-
-        // Prepare argv for posix_spawn
-        let cargs = [executable] + args
-        var argv: [UnsafeMutablePointer<CChar>?] = cargs.map { strdup($0) }
-        argv.append(nil)
-
-        // Prepare environment variables for posix_spawn
-        var envp: [UnsafeMutablePointer<CChar>?] = environment.map { key, value in
-            return strdup("\(key)=\(value)")
-        }
-        envp.append(nil)
-
-        #if os(macOS)
-        // On macOS, posix_spawn uses optional types
-        var fileActions: posix_spawn_file_actions_t?
-        posix_spawn_file_actions_init(&fileActions)
-        posix_spawn_file_actions_adddup2(&fileActions, slaveFD, STDIN_FILENO)
-        posix_spawn_file_actions_adddup2(&fileActions, slaveFD, STDOUT_FILENO)
-        posix_spawn_file_actions_adddup2(&fileActions, slaveFD, STDERR_FILENO)
-
-        var attr: posix_spawnattr_t?
-        posix_spawnattr_init(&attr)
-        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSID))
-        #else
-        // On Linux, posix_spawn uses non-optional types
-        var fileActions = posix_spawn_file_actions_t()
-        posix_spawn_file_actions_init(&fileActions)
-        posix_spawn_file_actions_adddup2(&fileActions, slaveFD, STDIN_FILENO)
-        posix_spawn_file_actions_adddup2(&fileActions, slaveFD, STDOUT_FILENO)
-        posix_spawn_file_actions_adddup2(&fileActions, slaveFD, STDERR_FILENO)
-
-        var attr = posix_spawnattr_t()
-        posix_spawnattr_init(&attr)
-        // On Linux, POSIX_SPAWN_SETSID might not be available, use 0 for now
-        posix_spawnattr_setflags(&attr, 0)
-        #endif
-
-        // Clear the screen
-        print("\u{1B}[2J\u{1B}[H", terminator: "")
-
-        var pid: pid_t = 0
-        #if os(macOS)
-        let spawnResult = posix_spawn(&pid, executable, &fileActions, &attr, &argv, &envp)
-        posix_spawn_file_actions_destroy(&fileActions)
-        posix_spawnattr_destroy(&attr)
-        #else
-        let spawnResult = posix_spawn(&pid, executable, &fileActions, &attr, &argv, &envp)
-        posix_spawn_file_actions_destroy(&fileActions)
-        posix_spawnattr_destroy(&attr)
-        #endif
-        argv.forEach { free($0) }
-        envp.forEach { free($0) }
-
-        if spawnResult != 0 {
-            throw NSError(domain: NSPOSIXErrorDomain, code: Int(spawnResult))
-        }
-
-        close(slaveFD)
-
-        // Put stdin in raw mode
-        var origTerm = termios()
-        tcgetattr(STDIN_FILENO, &origTerm)
-        var raw = origTerm
-        cfmakeraw(&raw)
-        tcsetattr(STDIN_FILENO, TCSANOW, &raw)
-
-        // Relay loop using poll()
-        var fds: [pollfd] = [
-            pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0),
-            pollfd(fd: masterFD, events: Int16(POLLIN | POLLHUP), revents: 0)
-        ]
-
-        var buf = [UInt8](repeating: 0, count: 1024)
-        relay: while true {
-            // Reset revents for each poll call
-            fds[0].revents = 0
-            fds[1].revents = 0
-
-            let ready = poll(&fds, nfds_t(fds.count), 1000) // 1 second timeout
-            if ready > 0 {
-                // Input from user → child
-                if (fds[0].revents & Int16(POLLIN)) != 0 {
-                    let n = read(STDIN_FILENO, &buf, buf.count)
-                    if n > 0 {
-                        write(masterFD, buf, n)
-                    }
-                }
-                // Output from child → user
-                if (fds[1].revents & Int16(POLLIN)) != 0 {
-                    let n = read(masterFD, &buf, buf.count)
-                    if n > 0 {
-                        write(STDOUT_FILENO, buf, n)
-                    } else {
-                        break relay // child closed
-                    }
-                }
-                // Check for hangup on master FD (child process exited)
-                if (fds[1].revents & Int16(POLLHUP)) != 0 {
-                    break relay
-                }
-            } else if ready == 0 {
-                // Timeout - check if child process has exited
-                var childStatus: Int32 = 0
-                let result = waitpid(pid, &childStatus, WNOHANG)
-                if result == pid {
-                    // Child has exited
-                    break relay
-                } else if result == -1 && errno == ECHILD {
-                    // Child no longer exists
-                    break relay
-                }
-                // Continue polling if child is still alive
-            } else {
-                break relay
-            }
-        }
-
-        // Restore terminal
-        tcsetattr(STDIN_FILENO, TCSANOW, &origTerm)
-
-        var status: Int32 = 0
-        let waitResult = waitpid(pid, &status, WNOHANG)
-        if waitResult == 0 {
-            // Child is still running, wait for it
-            waitpid(pid, &status, 0)
-        }
-        return status
     }
 }
 
