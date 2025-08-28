@@ -429,14 +429,7 @@ final class DebugTestRunner {
             }
         }
 
-        // Add failure breakpoint commands based on available libraries
-        if hasSwiftTesting && hasXCTest {
-            lldbCommands.append("command alias failbreak script lldb.debugger.HandleCommand('breakpoint set -s Testing -n \"failureBreakpoint()\"'); lldb.debugger.HandleCommand('breakpoint set -s XCTest -n \"xcTestFailureFunction()\"')")
-        } else if hasSwiftTesting {
-            lldbCommands.append("command alias failbreak breakpoint set -s Testing -n \"failureBreakpoint()\"")
-        } else if hasXCTest {
-            lldbCommands.append("command alias failbreak breakpoint set -s XCTest -n \"xcTestFailureFunction()\"")
-        }
+        setupBreakpointAliases(&lldbCommands, hasSwiftTesting: hasSwiftTesting, hasXCTest: hasXCTest)
 
         // Create the target switching Python script
         let scriptPath = try createTargetSwitchingScript()
@@ -463,18 +456,35 @@ final class DebugTestRunner {
         let modulePath = getModulePath(for: target)
         lldbCommands.append("target modules add \"\(modulePath.pathString)\"")
 
-        // Add failure breakpoint command based on the testing library
-        if target.library == .swiftTesting {
-            lldbCommands.append("command alias failbreak breakpoint set -s Testing -n \"failureBreakpoint()\"")
-        } else if target.library == .xctest {
-            lldbCommands.append("command alias failbreak breakpoint set -s XCTest -n \"xcTestFailureFunction()\"")
-        }
+        setupBreakpointAliases(&lldbCommands, hasSwiftTesting: target.library == .swiftTesting, hasXCTest: target.library == .xctest)
 
         // Clear screen and show ready message
         lldbCommands.append("script print(\"\\033[H\\033[J\", end=\"\")")
         let libraryName = target.library == .xctest ? "XCTest" : "Swift Testing"
         let message = "\\n\\nStarting LLDB debugging session for \(libraryName) tests...\\n\\n"
         lldbCommands.append("script print(\"\(message)\", end=\"\")")
+    }
+
+    private func setupBreakpointAliases(_ lldbCommands: inout [String], hasSwiftTesting: Bool, hasXCTest: Bool) {
+        #if os(macOS)
+            let swiftTestingFailureBreakpoint = "-s Testing -n \"failureBreakpoint()\""
+            let xctestFailureBreakpoint = "-s XCTestCore -n \"_XCTFailureBreakpoint\""
+        #elseif os(Linux)
+            let swiftTestingFailureBreakpoint = "-s libTesting.so -n \"Testing.failureBreakpoint\""
+            let xctestFailureBreakpoint = "-s libXCTest.so -n \"XCTest.XCTestCase.recordFailure\""
+        #else
+            // TODO: Windows
+            return
+        #endif
+
+        // Add failure breakpoint commands based on available libraries
+        if hasSwiftTesting && hasXCTest {
+            lldbCommands.append("command alias failbreak script lldb.debugger.HandleCommand('breakpoint set \(swiftTestingFailureBreakpoint)'); lldb.debugger.HandleCommand('breakpoint set \(xctestFailureBreakpoint)')")
+        } else if hasSwiftTesting {
+            lldbCommands.append("command alias failbreak breakpoint set \(swiftTestingFailureBreakpoint)")
+        } else if hasXCTest {
+            lldbCommands.append("command alias failbreak breakpoint set \(xctestFailureBreakpoint)")
+        }
     }
 
     /// Gets the executable path and arguments for a given testing library
