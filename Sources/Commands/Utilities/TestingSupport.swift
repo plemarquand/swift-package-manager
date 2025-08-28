@@ -406,6 +406,9 @@ final class DebugTestRunner {
 
     /// Sets up multiple targets when both XCTest and Swift Testing are available
     private func setupMultipleTargets(_ lldbCommands: inout [String]) throws {
+        var hasSwiftTesting = false
+        var hasXCTest = false
+
         for testingLibrary in target.libraries {
             let (executable, args) = try getExecutableAndArgs(for: testingLibrary)
             lldbCommands.append("target create \(executable.pathString)")
@@ -417,6 +420,21 @@ final class DebugTestRunner {
 
             let modulePath = getModulePath(for: testingLibrary)
             lldbCommands.append("target modules add \"\(modulePath.pathString)\"")
+
+            if testingLibrary.library == .swiftTesting {
+                hasSwiftTesting = true
+            } else if testingLibrary.library == .xctest {
+                hasXCTest = true
+            }
+        }
+
+        // Add failure breakpoint commands based on available libraries
+        if hasSwiftTesting && hasXCTest {
+            lldbCommands.append("command alias failbreak script lldb.debugger.HandleCommand('breakpoint set -s Testing -n \"failureBreakpoint()\"'); lldb.debugger.HandleCommand('breakpoint set -s XCTest -n \"xcTestFailureFunction()\"')")
+        } else if hasSwiftTesting {
+            lldbCommands.append("command alias failbreak breakpoint set -s Testing -n \"failureBreakpoint()\"")
+        } else if hasXCTest {
+            lldbCommands.append("command alias failbreak breakpoint set -s XCTest -n \"xcTestFailureFunction()\"")
         }
 
         // Create the target switching Python script
@@ -443,6 +461,13 @@ final class DebugTestRunner {
         // Load symbols for the test bundle
         let modulePath = getModulePath(for: target)
         lldbCommands.append("target modules add \"\(modulePath.pathString)\"")
+
+        // Add failure breakpoint command based on the testing library
+        if target.library == .swiftTesting {
+            lldbCommands.append("command alias failbreak breakpoint set -s Testing -n \"failureBreakpoint()\"")
+        } else if target.library == .xctest {
+            lldbCommands.append("command alias failbreak breakpoint set -s XCTest -n \"xcTestFailureFunction()\"")
+        }
 
         // Clear screen and show ready message
         lldbCommands.append("script print(\"\\033[H\\033[J\", end=\"\")")
@@ -507,34 +532,45 @@ def sync_breakpoints_to_target(source_target, dest_target):
     if not source_target or not dest_target:
         return
 
-    def breakpoint_exists_in_target(target, file_spec, line_number, symbol_name=None):
-        \"\"\"Check if a breakpoint already exists in the target.\"\"\"
+    def breakpoint_exists_in_target_by_spec(target, file_name, line_number, function_name):
+        \"\"\"Check if a breakpoint already exists in the target by specification.\"\"\"
         for i in range(target.GetNumBreakpoints()):
             existing_bp = target.GetBreakpointAtIndex(i)
             if not existing_bp.IsValid():
                 continue
 
-            for j in range(existing_bp.GetNumLocations()):
-                existing_location = existing_bp.GetLocationAtIndex(j)
-                if not existing_location.IsValid():
-                    continue
+            # Check function name breakpoints
+            if function_name:
+                # Get the breakpoint's function name specifications
+                names = lldb.SBStringList()
+                existing_bp.GetNames(names)
 
-                existing_addr = existing_location.GetAddress()
-                existing_line_entry = existing_addr.GetLineEntry()
-
-                if existing_line_entry.IsValid() and file_spec and line_number:
-                    # Check line breakpoints
-                    existing_file_spec = existing_line_entry.GetFileSpec()
-                    existing_line_number = existing_line_entry.GetLine()
-
-                    if (existing_file_spec.GetFilename() == file_spec.GetFilename() and
-                        existing_line_number == line_number):
+                # Check names from GetNames()
+                for j in range(names.GetSize()):
+                    if names.GetStringAtIndex(j) == function_name:
                         return True
-                elif symbol_name:
-                    # Check function name breakpoints
-                    existing_symbol = existing_addr.GetSymbol()
-                    if existing_symbol.IsValid() and existing_symbol.GetName() == symbol_name:
+
+                # If no names found, check the description for pending breakpoints
+                if names.GetSize() == 0:
+                    bp_desc = str(existing_bp).strip()
+                    import re
+                    match = re.search(r"name = '([^']+)'", bp_desc)
+                    if match and match.group(1) == function_name:
                         return True
+
+            # Check file/line breakpoints (only if resolved)
+            if file_name and line_number:
+                for j in range(existing_bp.GetNumLocations()):
+                    location = existing_bp.GetLocationAtIndex(j)
+                    if location.IsValid():
+                        addr = location.GetAddress()
+                        line_entry = addr.GetLineEntry()
+                        if line_entry.IsValid():
+                            existing_file_spec = line_entry.GetFileSpec()
+                            existing_line_number = line_entry.GetLine()
+                            if (existing_file_spec.GetFilename() == file_name and
+                                existing_line_number == line_number):
+                                return True
         return False
 
     # Get all breakpoints from source target
@@ -543,56 +579,67 @@ def sync_breakpoints_to_target(source_target, dest_target):
         if not bp.IsValid():
             continue
 
-        # Check if this is a new breakpoint we haven't seen before
-        bp_id = (bp.GetLocationAtIndex(0).GetAddress().GetFileAddress() if bp.GetNumLocations() > 0 else 0)
+        # Handle breakpoints by their specifications, not just resolved locations
+        # First check if this is a function name breakpoint
+        names = lldb.SBStringList()
+        bp.GetNames(names)
 
-        # For each location in the breakpoint
-        for j in range(bp.GetNumLocations()):
-            location = bp.GetLocationAtIndex(j)
-            if not location.IsValid():
-                continue
+        # For pending breakpoints, GetNames() might be empty, so also check the description
+        bp_desc = str(bp).strip()
 
-            addr = location.GetAddress()
-            line_entry = addr.GetLineEntry()
+        # Extract function name from description if names is empty
+        function_names_to_sync = []
+        if names.GetSize() > 0:
+            # Use the names from GetNames()
+            for j in range(names.GetSize()):
+                function_name = names.GetStringAtIndex(j)
+                if function_name:
+                    function_names_to_sync.append(function_name)
+        else:
+            # Parse function name from description for pending breakpoints
+            # Description format: "1: name = 'failureBreakpoint()', module = Testing, locations = 0 (pending)"
+            import re
+            match = re.search(r"name = '([^']+)'", bp_desc)
+            if match:
+                function_name = match.group(1)
+                function_names_to_sync.append(function_name)
 
-            if line_entry.IsValid():
-                file_spec = line_entry.GetFileSpec()
-                line_number = line_entry.GetLine()
-
-                # Check if this breakpoint already exists in destination target
-                if breakpoint_exists_in_target(dest_target, file_spec, line_number):
-                    continue
-
-                # Create the same breakpoint in the destination target
-                new_bp = dest_target.BreakpointCreateByLocation(file_spec, line_number)
+        # Sync the function name breakpoints
+        for function_name in function_names_to_sync:
+            if not breakpoint_exists_in_target_by_spec(dest_target, None, None, function_name):
+                new_bp = dest_target.BreakpointCreateByName(function_name)
                 if new_bp.IsValid():
-                    # Copy breakpoint properties
                     new_bp.SetEnabled(bp.IsEnabled())
                     new_bp.SetCondition(bp.GetCondition())
                     new_bp.SetIgnoreCount(bp.GetIgnoreCount())
 
-                    # Copy hit count if possible (read-only property, so we can't actually set it)
-            else:
-                # Handle function name breakpoints
-                for k in range(bp.GetNumLocations()):
-                    loc = bp.GetLocationAtIndex(k)
-                    if loc.IsValid():
-                        symbol = loc.GetAddress().GetSymbol()
-                        if symbol.IsValid():
-                            symbol_name = symbol.GetName()
-                            if symbol_name:
-                                # Check if this function breakpoint already exists
-                                if breakpoint_exists_in_target(dest_target, None, None, symbol_name):
-                                    print(f"Function breakpoint already exists for {symbol_name}, skipping")
-                                    continue
+        # Handle resolved location-based breakpoints (file/line)
+        # Only process if the breakpoint has resolved locations
+        if bp.GetNumLocations() > 0:
+            for j in range(bp.GetNumLocations()):
+                location = bp.GetLocationAtIndex(j)
+                if not location.IsValid():
+                    continue
 
-                                print(f"Creating function breakpoint for {symbol_name}")
-                                new_bp = dest_target.BreakpointCreateByName(symbol_name)
-                                if new_bp.IsValid():
-                                    new_bp.SetEnabled(bp.IsEnabled())
-                                    new_bp.SetCondition(bp.GetCondition())
-                                    new_bp.SetIgnoreCount(bp.GetIgnoreCount())
-                                break
+                addr = location.GetAddress()
+                line_entry = addr.GetLineEntry()
+
+                if line_entry.IsValid():
+                    file_spec = line_entry.GetFileSpec()
+                    line_number = line_entry.GetLine()
+                    file_name = file_spec.GetFilename()
+
+                    # Check if this breakpoint already exists in destination target
+                    if breakpoint_exists_in_target_by_spec(dest_target, file_name, line_number, None):
+                        continue
+
+                    # Create the same breakpoint in the destination target
+                    new_bp = dest_target.BreakpointCreateByLocation(file_spec, line_number)
+                    if new_bp.IsValid():
+                        # Copy breakpoint properties
+                        new_bp.SetEnabled(bp.IsEnabled())
+                        new_bp.SetCondition(bp.GetCondition())
+                        new_bp.SetIgnoreCount(bp.GetIgnoreCount())
 
 def sync_breakpoints_to_all_targets():
     \"\"\"Synchronize breakpoints from current target to all other targets.\"\"\"
@@ -672,7 +719,7 @@ def check_process_status():
 
                             # Clear the current line and move cursor to start
                             sys.stdout.write("\\033[2K\\r")
-                            # Reprint a fake prompt (optional)
+                            # Reprint a fake prompt
                             sys.stdout.write("(lldb) ")
                             sys.stdout.flush()
                 elif process and process.GetState() in [lldb.eStateRunning, lldb.eStateLaunching]:
