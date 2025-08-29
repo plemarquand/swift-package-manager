@@ -310,6 +310,7 @@ final class DebugTestRunner {
     private let cancellator: Cancellator
     private let fileSystem: FileSystem
     private let observabilityScope: ObservabilityScope
+    private let verbose: Bool
 
     /// Creates an instance of debug test runner.
     init(
@@ -319,7 +320,8 @@ final class DebugTestRunner {
         testEnv: Environment,
         cancellator: Cancellator,
         fileSystem: FileSystem,
-        observabilityScope: ObservabilityScope
+        observabilityScope: ObservabilityScope,
+        verbose: Bool = false
     ) {
         self.target = target
         self.buildParameters = buildParameters
@@ -328,6 +330,7 @@ final class DebugTestRunner {
         self.cancellator = cancellator
         self.fileSystem = fileSystem
         self.observabilityScope = observabilityScope
+        self.verbose = verbose
     }
 
     /// Launches the test binary under LLDB for interactive debugging.
@@ -398,6 +401,12 @@ final class DebugTestRunner {
             try setupSingleTarget(&lldbCommands, for: target.libraries.first!)
         }
 
+        // Clear the screen of all the previous commands to unclutter the users initial state.
+        // Skip clearing in verbose mode so startup commands remain visible
+        if !verbose {
+            lldbCommands.append("script print(\"\\033[H\\033[J\", end=\"\")")
+        }
+
         let commandScript = lldbCommands.joined(separator: "\n")
         try fileSystem.writeFileContents(lldbCommandFile, string: commandScript)
 
@@ -429,7 +438,7 @@ final class DebugTestRunner {
             }
         }
 
-        setupBreakpointAliases(&lldbCommands, hasSwiftTesting: hasSwiftTesting, hasXCTest: hasXCTest)
+        setupCommandAliases(&lldbCommands, hasSwiftTesting: hasSwiftTesting, hasXCTest: hasXCTest)
 
         // Create the target switching Python script
         let scriptPath = try createTargetSwitchingScript()
@@ -437,7 +446,6 @@ final class DebugTestRunner {
 
         // Select the first target and launch with pause on main
         lldbCommands.append("target select 0")
-        lldbCommands.append("script print(\"\\033[H\\033[J\", end=\"\")")
     }
 
     /// Sets up a single target when only one testing library is available
@@ -456,16 +464,10 @@ final class DebugTestRunner {
         let modulePath = getModulePath(for: target)
         lldbCommands.append("target modules add \"\(modulePath.pathString)\"")
 
-        setupBreakpointAliases(&lldbCommands, hasSwiftTesting: target.library == .swiftTesting, hasXCTest: target.library == .xctest)
-
-        // Clear screen and show ready message
-        lldbCommands.append("script print(\"\\033[H\\033[J\", end=\"\")")
-        let libraryName = target.library == .xctest ? "XCTest" : "Swift Testing"
-        let message = "\\n\\nStarting LLDB debugging session for \(libraryName) tests...\\n\\n"
-        lldbCommands.append("script print(\"\(message)\", end=\"\")")
+        setupCommandAliases(&lldbCommands, hasSwiftTesting: target.library == .swiftTesting, hasXCTest: target.library == .xctest)
     }
 
-    private func setupBreakpointAliases(_ lldbCommands: inout [String], hasSwiftTesting: Bool, hasXCTest: Bool) {
+    private func setupCommandAliases(_ lldbCommands: inout [String], hasSwiftTesting: Bool, hasXCTest: Bool) {
         #if os(macOS)
             let swiftTestingFailureBreakpoint = "-s Testing -n \"failureBreakpoint()\""
             let xctestFailureBreakpoint = "-n \"_XCTFailureBreakpoint\""
@@ -476,6 +478,9 @@ final class DebugTestRunner {
             // TODO: Windows
             return
         #endif
+
+        // Add clear screen alias
+        lldbCommands.append("command alias clear script print(\"\\033[H\\033[J\", end=\"\")")
 
         // Add failure breakpoint commands based on available libraries
         if hasSwiftTesting && hasXCTest {

@@ -665,7 +665,8 @@ public struct SwiftTestCommand: AsyncSwiftCommand {
             ),
             cancellator: swiftCommandState.cancellator,
             fileSystem: swiftCommandState.fileSystem,
-            observabilityScope: swiftCommandState.observabilityScope
+            observabilityScope: swiftCommandState.observabilityScope,
+            verbose: globalOptions.logging.verbose
         )
 
         // Launch LLDB using AsyncProcess with proper input/output forwarding
