@@ -33,18 +33,18 @@ import var TSCBasic.stdoutStream
 import func TSCBasic.withTemporaryFile
 import func TSCBasic.exec
 
-struct DebuggableTestTarget {
-    struct Pairing {
+struct DebuggableTestSession {
+    struct Target {
         let library: TestingLibrary
         let additionalArgs: [String]
         let bundlePath: AbsolutePath
     }
 
-    let libraries: [Pairing]
+    let targets: [Target]
 
     /// Whether this is part of a multi-session sequence
     var isMultiSession: Bool {
-        libraries.count > 1
+        targets.count > 1
     }
 }
 
@@ -303,7 +303,7 @@ enum TestingSupport {
 
 /// A class to run tests under LLDB debugger.
 final class DebugTestRunner {
-    private let target: DebuggableTestTarget
+    private let target: DebuggableTestSession
     private let buildParameters: BuildParameters
     private let toolchain: UserToolchain
     private let testEnv: Environment
@@ -314,7 +314,7 @@ final class DebugTestRunner {
 
     /// Creates an instance of debug test runner.
     init(
-        target: DebuggableTestTarget,
+        target: DebuggableTestSession,
         buildParameters: BuildParameters,
         toolchain: UserToolchain,
         testEnv: Environment,
@@ -366,9 +366,12 @@ final class DebugTestRunner {
         observabilityScope.emit(info: "LLDB will run: \(lldbPath.pathString) \(lldbArgs.joined(separator: " "))")
 
         // Set environment variables from testEnv on the current process
-        // so they are inherited by the exec'd LLDB process
+        // so they are inherited by the exec'd LLDB process. Exec will replace
+        // this process.
         for (key, value) in testEnv {
-            setenv(key.rawValue, value, 1)
+            if setenv(key.rawValue, value, 1) != 0 {
+                observabilityScope.emit(info: "Failed to set environment variable \(key.rawValue)=\(value)")
+            }
         }
 
         // On Linux, use exec to replace the current process with LLDB
@@ -390,15 +393,17 @@ final class DebugTestRunner {
     /// - Parameter library: The testing library being used (XCTest or Swift Testing)
     /// - Returns: Array of LLDB command line arguments
     /// - Throws: Various errors if required tools are not found or file operations fail
-    private func prepareLLDBArguments(for target: DebuggableTestTarget) throws -> [String] {
+    private func prepareLLDBArguments(for target: DebuggableTestSession) throws -> [String] {
         let tempDir = try fileSystem.tempDirectory
         let lldbCommandFile = tempDir.appending("lldb-commands.txt")
 
         var lldbCommands: [String] = []
         if target.isMultiSession {
             try setupMultipleTargets(&lldbCommands)
+        } else if let library = target.targets.first {
+            try setupSingleTarget(&lldbCommands, for: library)
         } else {
-            try setupSingleTarget(&lldbCommands, for: target.libraries.first!)
+            throw StringError("No testing libraries found for debugging")
         }
 
         // Clear the screen of all the previous commands to unclutter the users initial state.
@@ -419,7 +424,7 @@ final class DebugTestRunner {
         var hasSwiftTesting = false
         var hasXCTest = false
 
-        for testingLibrary in target.libraries {
+        for testingLibrary in target.targets {
             let (executable, args) = try getExecutableAndArgs(for: testingLibrary)
             lldbCommands.append("target create \(executable.pathString)")
             lldbCommands.append("settings clear target.run-args")
@@ -449,7 +454,7 @@ final class DebugTestRunner {
     }
 
     /// Sets up a single target when only one testing library is available
-    private func setupSingleTarget(_ lldbCommands: inout [String], for target: DebuggableTestTarget.Pairing) throws {
+    private func setupSingleTarget(_ lldbCommands: inout [String], for target: DebuggableTestSession.Target) throws {
         let (executable, args) = try getExecutableAndArgs(for: target)
         // Create target
         lldbCommands.append("target create \(executable.pathString)")
@@ -493,7 +498,7 @@ final class DebugTestRunner {
     }
 
     /// Gets the executable path and arguments for a given testing library
-    private func getExecutableAndArgs(for target: DebuggableTestTarget.Pairing) throws -> (AbsolutePath, [String]) {
+    private func getExecutableAndArgs(for target: DebuggableTestSession.Target) throws -> (AbsolutePath, [String]) {
         switch target.library {
         case .xctest:
             #if os(macOS)
@@ -517,7 +522,7 @@ final class DebugTestRunner {
     }
 
     /// Gets the module path for symbol loading
-    private func getModulePath(for target: DebuggableTestTarget.Pairing) -> AbsolutePath {
+    private func getModulePath(for target: DebuggableTestSession.Target) -> AbsolutePath {
         var modulePath = target.bundlePath
         if target.library == .xctest && buildParameters.triple.isDarwin() {
             if let name = target.bundlePath.components.last?.replacing(".xctest", with: "") {

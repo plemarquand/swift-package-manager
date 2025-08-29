@@ -577,9 +577,9 @@ public struct SwiftTestCommand: AsyncSwiftCommand {
 
         try await runTestLibrariesWithLLDB(
             testProduct: testProduct,
-            target: DebuggableTestTarget(
-                libraries: librariesToRun.map {
-                    DebuggableTestTarget.Pairing(
+            target: DebuggableTestSession(
+                targets: librariesToRun.map {
+                    DebuggableTestSession.Target(
                         library: $0,
                         additionalArgs: try additionalLLDBArguments(for: $0, testProducts: testProducts, swiftCommandState: swiftCommandState),
                         bundlePath: testBundlePath(for: $0, testProduct: testProduct)
@@ -646,7 +646,7 @@ public struct SwiftTestCommand: AsyncSwiftCommand {
     ///   - sessionState: The debugging session state for breakpoint persistence
     private func runTestLibrariesWithLLDB(
         testProduct: BuiltTestProduct,
-        target: DebuggableTestTarget,
+        target: DebuggableTestSession,
         testProducts: [BuiltTestProduct],
         productsBuildParameters: BuildParameters,
         swiftCommandState: SwiftCommandState,
