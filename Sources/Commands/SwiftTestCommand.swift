@@ -895,6 +895,12 @@ public struct SwiftTestCommand: AsyncSwiftCommand {
     ///
     /// - Throws: if --debugger is used with incompatible flags
     private func validateLLDBCompatibility(swiftCommandState: SwiftCommandState) throws {
+        // --debugger cannot be used with release configuration
+        let configuration = options.globalOptions.build.configuration ?? swiftCommandState.preferredBuildConfiguration
+        if configuration == .release {
+            throw StringError("--debugger cannot be used with release configuration (debugging requires debug symbols)")
+        }
+
         // --debugger cannot be used with parallel testing
         if options.shouldRunInParallel {
             throw StringError("--debugger cannot be used with --parallel (debugging requires sequential execution)")
