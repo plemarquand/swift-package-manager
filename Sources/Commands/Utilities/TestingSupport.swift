@@ -468,7 +468,7 @@ final class DebugTestRunner {
     private func setupBreakpointAliases(_ lldbCommands: inout [String], hasSwiftTesting: Bool, hasXCTest: Bool) {
         #if os(macOS)
             let swiftTestingFailureBreakpoint = "-s Testing -n \"failureBreakpoint()\""
-            let xctestFailureBreakpoint = "-s XCTestCore -n \"_XCTFailureBreakpoint\""
+            let xctestFailureBreakpoint = "-n \"_XCTFailureBreakpoint\""
         #elseif os(Linux)
             let swiftTestingFailureBreakpoint = "-s libTesting.so -n \"Testing.failureBreakpoint\""
             let xctestFailureBreakpoint = "-s libXCTest.so -n \"XCTest.XCTestCase.recordFailure\""
@@ -499,7 +499,6 @@ final class DebugTestRunner {
             #else
             return (target.bundlePath, target.additionalArgs)
             #endif
-
         case .swiftTesting:
             #if os(macOS)
             let executable = try toolchain.getSwiftTestingHelper()
