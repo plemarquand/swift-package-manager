@@ -374,14 +374,11 @@ final class DebugTestRunner {
         // so they are inherited by the exec'd LLDB process. Exec will replace
         // this process.
         for (key, value) in testEnv {
-            if setenv(key.rawValue, value, 1) != 0 {
-                observabilityScope.emit(info: "Failed to set environment variable \(key.rawValue)=\(value)")
-            }
+            try Environment.set(key: key, value: value)
         }
 
         // Check if we're running Swift Package Manager's own tests
         let isRunningTests = Environment.current["SWIFTPM_TESTS_LLDB"] != nil
-        print(">>> Running tests? \(isRunningTests) <<<")
 
         if isRunningTests {
             // When running tests, use AsyncProcess to launch LLDB as a subprocess
@@ -406,7 +403,6 @@ final class DebugTestRunner {
     ///   - args: Command line arguments for LLDB
     /// - Throws: Process execution errors
     private func runLLDBForTesting(lldbPath: AbsolutePath, args: [String]) throws {
-        print(">>> GO \(lldbPath) \(args)")
         let process = AsyncProcess(
             arguments: [lldbPath.pathString] + args,
             environment: testEnv,
@@ -423,9 +419,6 @@ final class DebugTestRunner {
         if let stderr = try? result.utf8stderrOutput() {
             print(stderr, terminator: "")
         }
-
-        print(">>> GOT ANYTHING? 1 \(try? result.utf8Output().count)")
-        print(">>> GOT ANYTHING? 2 \(try? result.utf8stderrOutput().count)")
 
         // Exit with the same code as LLDB to indicate success/failure
         switch result.exitStatus {
@@ -535,12 +528,9 @@ final class DebugTestRunner {
         #if os(macOS)
             let swiftTestingFailureBreakpoint = "-s Testing -n \"failureBreakpoint()\""
             let xctestFailureBreakpoint = "-n \"_XCTFailureBreakpoint\""
-        #elseif os(Linux)
+        #else
             let swiftTestingFailureBreakpoint = "-s libTesting.so -n \"Testing.failureBreakpoint\""
             let xctestFailureBreakpoint = "-s libXCTest.so -n \"XCTest.XCTestCase.recordFailure\""
-        #else
-            // TODO: Windows
-            return
         #endif
 
         // Add clear screen alias
