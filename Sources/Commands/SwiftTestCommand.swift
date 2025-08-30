@@ -566,15 +566,6 @@ public struct SwiftTestCommand: AsyncSwiftCommand {
             throw StringError("No testing libraries are enabled for debugging")
         }
 
-        // Inform user about skipped libraries
-        if !skippedLibraries.isEmpty {
-            for (library, reason) in skippedLibraries {
-                let libraryName = library == .xctest ? "XCTest" : "Swift Testing"
-                print("Skipping \(libraryName) debugging: \(reason)")
-            }
-            print()
-        }
-
         try await runTestLibrariesWithLLDB(
             testProduct: testProduct,
             target: DebuggableTestSession(
