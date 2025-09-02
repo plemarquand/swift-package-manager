@@ -6,7 +6,7 @@ final class TestPackageXCTests: XCTestCase {
         let result = addNumbers(3, 4)
         XCTAssertEqual(result, 7)
     }
-    
+
     func testMultiplication() {
         let result = multiplyNumbers(6, 7)
         XCTAssertEqual(result, 42)
