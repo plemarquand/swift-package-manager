@@ -528,6 +528,9 @@ final class DebugTestRunner {
         #if os(macOS)
             let swiftTestingFailureBreakpoint = "-s Testing -n \"failureBreakpoint()\""
             let xctestFailureBreakpoint = "-n \"_XCTFailureBreakpoint\""
+        #elseif os(Windows)
+            let swiftTestingFailureBreakpoint = "-s Testing.dll -n \"failureBreakpoint()\""
+            let xctestFailureBreakpoint = "-s XCTest.dll -n \"XCTest.XCTestCase.recordFailure\""
         #else
             let swiftTestingFailureBreakpoint = "-s libTesting.so -n \"Testing.failureBreakpoint\""
             let xctestFailureBreakpoint = "-s libXCTest.so -n \"XCTest.XCTestCase.recordFailure\""
