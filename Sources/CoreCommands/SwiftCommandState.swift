@@ -1043,6 +1043,23 @@ public final class SwiftCommandState {
     when building on macOS.
     """
 
+    package func computeSDKRootOverride() -> AbsolutePath? {
+        let sdkRootOverride = self.options.build.customCompileSDK
+            ?? self.environment["SDKROOT"].flatMap { try? AbsolutePath(validating: $0) }
+        guard let sdkRootOverride else {
+            return nil
+        }
+        if let swiftSDKSelector = self.options.build.swiftSDKSelector {
+            let source = self.options.build.customCompileSDK != nil
+                ? "'--sdk'"
+                : "the 'SDKROOT' environment variable"
+            self.observabilityScope.emit(warning: "ignoring the SDK '\(sdkRootOverride)' specified using \(source) because the Swift SDK '\(swiftSDKSelector)' was selected with '--swift-sdk'")
+            return nil
+        } else {
+            return sdkRootOverride
+        }
+    }
+
     private func _buildParams(
         toolchain: UserToolchain,
         destination: BuildParameters.Destination,
@@ -1071,7 +1088,7 @@ public final class SwiftCommandState {
             configuration: self.options.build.configuration ?? self.preferredBuildConfiguration,
             toolchain: toolchain,
             triple: triple,
-            sdkRootOverride: self.options.build.customCompileSDK ?? self.environment["SDKROOT"].flatMap({ try? AbsolutePath(validating: $0) }),
+            sdkRootOverride: self.computeSDKRootOverride(),
             flags: options.build.buildFlags,
             buildSystemKind: options.build.buildSystem,
             pkgConfigDirectories: options.locations.pkgConfigDirectories,
