@@ -1066,12 +1066,18 @@ public final class SwiftBuildSystem: SPMBuildCore.BuildSystem {
                 settings[setting.enableVariableName] = "YES"
                 settings[setting.pathVariable] = try await self.indexStore(for: self.buildParameters).pathStringWithPosixSlashes
             }
+            // When indexing is explicitly enabled, set COMPILER_INDEX_STORE_ENABLE explicitly to allow index-while-building
+            // with optimizations enabled.
+            settings["COMPILER_INDEX_STORE_ENABLE"] = "YES"
         case .off:
             for setting in indexStoreSettingNames {
                 settings[setting.enableVariableName] = "NO"
             }
         case .auto:
-            // The settings are handles in the PIF builder
+            // The enablement settings are handled in the PIF builder
+            for setting in indexStoreSettingNames {
+                settings[setting.pathVariable] = try await self.indexStore(for: self.buildParameters).pathStringWithPosixSlashes
+            }
             break
         }
 
@@ -1144,6 +1150,14 @@ public final class SwiftBuildSystem: SPMBuildCore.BuildSystem {
         let ddPathPrefix = derivedDataPath.pathString
         #endif
 
+        let indexEnableDataStore: Bool
+        switch buildParameters.indexStoreMode {
+        case .off:
+            indexEnableDataStore = false
+        case .on, .auto:
+            indexEnableDataStore = true
+        }
+
         let arenaInfo = SWBArenaInfo(
             derivedDataPath: ddPathPrefix,
             buildProductsPath: ddPathPrefix + "/Products",
@@ -1153,7 +1167,7 @@ public final class SwiftBuildSystem: SPMBuildCore.BuildSystem {
             indexRegularBuildIntermediatesPath: nil,
             indexPCHPath: ddPathPrefix,
             indexDataStoreFolderPath: ddPathPrefix,
-            indexEnableDataStore: request.parameters.arenaInfo?.indexEnableDataStore ?? false
+            indexEnableDataStore: request.parameters.arenaInfo?.indexEnableDataStore ?? indexEnableDataStore
         )
 
         request.parameters.arenaInfo = arenaInfo
