@@ -588,7 +588,7 @@ struct SwiftPMBuildServerTests {
         }
     }
 
-    @Test
+    @Test(.disabled("test is flaky in nightly toolchain builds"), .issue("https://github.com/swiftlang/swift-package-manager/issues/10514", relationship: .defect))
     func manifestPrepareIsNotForwardedToUnderlyingBuildServer() async throws {
         try await withSwiftPMBSP(fixtureName: "Miscellaneous/Simple") { connection, notificationCollector, _ in
             let targetResponse = try await connection.send(WorkspaceBuildTargetsRequest())
