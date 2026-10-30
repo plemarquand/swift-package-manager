@@ -658,7 +658,10 @@ extension Workspace {
 
         var allNodes = OrderedDictionary<PackageIdentity, GraphLoadingNode>()
 
-        do {
+        // A manifest loaded late in the walk can enable traits on a package already visited, so walk
+        // again until no visited package's traits change.
+        repeat {
+            allNodes = [:]
             let manifestGraphRoots = try topLevelManifests.map { identity, manifest in
                 return try KeyedPair(
                     GraphLoadingNode(
@@ -679,15 +682,20 @@ extension Workspace {
             } onDuplicate: { _, _ in
                 // Nothing we need to compute here.
             }
-        }
 
-        // Second pass: Update enabled traits for dependencies now that we have all manifests loaded
-        // This resolves the race condition where parents might set traits for dependencies
-        // before the dependency manifest is loaded and its default traits are known.
-        let allManifests = allNodes.mapValues(\.manifest)
-        for (_, manifest) in allManifests {
-            try await updateEnabledTraits(for: manifest, observabilityScope: observabilityScope)
+            // Second pass: Update enabled traits for dependencies now that we have all manifests loaded
+            // This resolves the race condition where parents might set traits for dependencies
+            // before the dependency manifest is loaded and its default traits are known.
+            for node in allNodes.values {
+                try await updateEnabledTraits(for: node.manifest, observabilityScope: observabilityScope)
+            }
+        } while allNodes.contains { identity, node in
+            let traits = topLevelManifests.keys.contains(identity) ?
+                self.enabledTraitsMap[node.manifest] :
+                self.enabledTraitsMap[identity]
+            return traits != node.enabledTraits
         }
+        let allManifests = allNodes.mapValues(\.manifest)
 
         // Now that every parent has registered its edges, each package's enabled traits are final
         // and can be reported on.
